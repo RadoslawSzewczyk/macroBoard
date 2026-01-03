@@ -11,16 +11,32 @@
 #include "nvs_flash.h"
 #include "lwip/sockets.h"
 #include "lwip/sys.h"
+#include "esp_lcd_panel_io.h"
+#include "esp_lcd_panel_vendor.h"
+#include "esp_lcd_panel_ops.h"
+#include "driver/spi_master.h"
 
 static const char *TAG = "MACRO_BOARD";
 
-#define GPIO_ROTARY_A    18
-#define GPIO_ROTARY_B    19
+#define PORT 5005
+
+#define GPIO_ROTARY_A    32
+#define GPIO_ROTARY_B    33
 #define GPIO_BUTTON      21
+
+#define PIN_NUM_MISO       -1 // Not used for ST7789
+#define PIN_NUM_MOSI       23
+#define PIN_NUM_CLK        18
+#define PIN_NUM_CS         5
+#define PIN_NUM_DC         2
+#define PIN_NUM_RST        4
+#define PIN_NUM_BK_LIGHT   -1
 
 #ifndef CONFIG_ESP_WIFI_SSID
     #error "Please configure WiFi in menuconfig (Project Configuration)!"
 #endif
+
+esp_lcd_panel_handle_t panel_handle = NULL;
 
 typedef struct {
     int cpu_usage;
@@ -126,6 +142,49 @@ void setup_wifi()
     ESP_LOGI("WIFI", "WiFi Initialized.");
 }
 
+void setup_display() {
+    ESP_LOGI("DISP", "Initializing SPI Bus...");
+    
+    spi_bus_config_t buscfg = {
+        .sclk_io_num = PIN_NUM_CLK,
+        .mosi_io_num = PIN_NUM_MOSI,
+        .miso_io_num = PIN_NUM_MISO,
+        .quadwp_io_num = -1,
+        .quadhd_io_num = -1,
+        .max_transfer_sz = 320 * 240 * 2 + 8
+    };
+    ESP_ERROR_CHECK(spi_bus_initialize(SPI3_HOST, &buscfg, SPI_DMA_CH_AUTO));
+
+    esp_lcd_panel_io_handle_t io_handle = NULL;
+    esp_lcd_panel_io_spi_config_t io_config = {
+        .dc_gpio_num = PIN_NUM_DC,
+        .cs_gpio_num = PIN_NUM_CS,
+        .pclk_hz = 20 * 1000 * 1000, // Reduced to 20MHz for stability
+        .lcd_cmd_bits = 8,
+        .lcd_param_bits = 8,
+        .spi_mode = 0,
+        .trans_queue_depth = 10,
+    };
+    ESP_ERROR_CHECK(esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)SPI3_HOST, &io_config, &io_handle));
+
+    esp_lcd_panel_dev_config_t panel_config = {
+        .reset_gpio_num = PIN_NUM_RST,
+        .rgb_endian = LCD_RGB_ENDIAN_RGB,
+        .bits_per_pixel = 16,
+    };
+    ESP_ERROR_CHECK(esp_lcd_new_panel_st7789(io_handle, &panel_config, &panel_handle));
+
+    ESP_ERROR_CHECK(esp_lcd_panel_reset(panel_handle));
+    ESP_ERROR_CHECK(esp_lcd_panel_init(panel_handle));
+    ESP_ERROR_CHECK(esp_lcd_panel_invert_color(panel_handle, true));
+    
+    // LANDSCAPE MODE
+    ESP_ERROR_CHECK(esp_lcd_panel_swap_xy(panel_handle, true)); 
+    ESP_ERROR_CHECK(esp_lcd_panel_mirror(panel_handle, false, true));
+
+    ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(panel_handle, true));
+}
+
 static const int8_t encoder_table[16] = {
     0,  1, -1,  0, 
    -1,  0,  0,  1, 
@@ -197,25 +256,134 @@ void app_main(void)
 }
 
 void task_network_ssh(void *pvParameters) {
+    char rx_buffer[128];
+    int addr_family = AF_INET;
+    int ip_protocol = 0;
+    
+    int sock = socket(addr_family, SOCK_DGRAM, ip_protocol);
+    if (sock < 0) {
+        ESP_LOGE("NET", "Unable to create socket: errno %d", errno);
+        vTaskDelete(NULL);
+        return;
+    }
+
+    struct sockaddr_in dest_addr;
+    dest_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    dest_addr.sin_family = AF_INET;
+    dest_addr.sin_port = htons(5005);
+    
+    if (bind(sock, (struct sockaddr *)&dest_addr, sizeof(dest_addr)) < 0) {
+        ESP_LOGE("NET", "Socket unable to bind: errno %d", errno);
+    }
+    ESP_LOGI("NET", "Socket bound to port 5005");
+
+    struct sockaddr_in pc_addr;
+    pc_addr.sin_addr.s_addr = inet_addr(CONFIG_PC_IP_ADDRESS);
+    pc_addr.sin_family = AF_INET;
+    pc_addr.sin_port = htons(5005);
+
+    int flags = fcntl(sock, F_GETFL);
+    fcntl(sock, F_SETFL, flags | O_NONBLOCK);
+
     int command_buffer;
 
-    ESP_LOGI("NET", "Network Task Started. Waiting for commands...");
-
     while(1) {
-        if (xQueueReceive(xCommandQueue, &command_buffer, portMAX_DELAY) == pdTRUE) {
+        if (xQueueReceive(xCommandQueue, &command_buffer, pdMS_TO_TICKS(10)) == pdTRUE) {
+            const char* msg = "";
+            if (command_buffer == CMD_BTN_CLICK) msg = "CLICK";
+            else if (command_buffer == CMD_VOL_UP) msg = "VOL_UP";
+            else if (command_buffer == CMD_VOL_DOWN) msg = "VOL_DOWN";
             
-            if (command_buffer == CMD_BTN_CLICK) {
-                 ESP_LOGW("NET", "Sending UDP: BUTTON_CLICK");
-            } else {
-                 ESP_LOGW("NET", "Sending UDP: VOL_CHANGE %d", command_buffer);
-            }
-            
+            sendto(sock, msg, strlen(msg), 0, (struct sockaddr *)&pc_addr, sizeof(pc_addr));
         }
+
+        struct sockaddr_in source_addr;
+        socklen_t socklen = sizeof(source_addr);
+        int len = recvfrom(sock, rx_buffer, sizeof(rx_buffer) - 1, 0, (struct sockaddr *)&source_addr, &socklen);
+
+        if (len > 0) {
+            rx_buffer[len] = 0;
+            
+            if (strncmp(rx_buffer, "STATS:", 6) == 0) {
+                int cpu, ram;
+                sscanf(rx_buffer, "STATS:%d:%d", &cpu, &ram);
+                
+                if (xSemaphoreTake(xStatsMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                    global_stats.cpu_usage = cpu;
+                    global_stats.ram_usage = ram;
+                    xSemaphoreGive(xStatsMutex);
+                    
+                    ESP_LOGI("NET", "Updated Stats -> CPU: %d%% | RAM: %d%%", cpu, ram);
+                }
+            }
+        }
+        
+        vTaskDelay(pdMS_TO_TICKS(10));
     }
 }
 
+uint16_t color_565(uint8_t r, uint8_t g, uint8_t b) {
+    return ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3);
+}
+
 void task_display_ui(void *pvParameters) {
-    while(1) { vTaskDelay(pdMS_TO_TICKS(1000)); }
+    setup_display();
+    
+    const int h_res = 320;
+    const int v_lines = 20;
+    
+    uint16_t *line_buffer = heap_caps_malloc(h_res * v_lines * sizeof(uint16_t), MALLOC_CAP_DMA);
+
+    ESP_LOGI("DISP", "Clearing Screen...");
+    
+    memset(line_buffer, 0, h_res * v_lines * sizeof(uint16_t));
+
+    for (int y = 0; y < 240; y += v_lines) {
+        esp_lcd_panel_draw_bitmap(panel_handle, 0, y, h_res, y + v_lines, line_buffer);
+    }
+
+    while(1) {
+        int cpu = 0, ram = 0;
+        
+        if (xSemaphoreTake(xStatsMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+            cpu = global_stats.cpu_usage;
+            ram = global_stats.ram_usage;
+            xSemaphoreGive(xStatsMutex);
+        }
+
+        memset(line_buffer, 0, h_res * v_lines * sizeof(uint16_t));
+        
+        int bar_width = (cpu * h_res) / 100; 
+        uint16_t color = (cpu > 80) ? color_565(255, 0, 0) : color_565(0, 255, 0);
+
+        for (int y = 0; y < v_lines; y++) {
+            for (int x = 0; x < h_res; x++) {
+                if (x < bar_width) {
+                    line_buffer[y * h_res + x] = color;
+                } else {
+                    line_buffer[y * h_res + x] = 0x0000;
+                }
+            }
+        }
+        esp_lcd_panel_draw_bitmap(panel_handle, 0, 50, h_res, 50 + v_lines, line_buffer);
+
+        memset(line_buffer, 0, h_res * v_lines * sizeof(uint16_t));
+
+        bar_width = (ram * h_res) / 100;
+        
+        for (int y = 0; y < v_lines; y++) {
+            for (int x = 0; x < h_res; x++) {
+                if (x < bar_width) {
+                    line_buffer[y * h_res + x] = color_565(0, 0, 255);
+                } else {
+                    line_buffer[y * h_res + x] = 0x0000;
+                }
+            }
+        }
+        esp_lcd_panel_draw_bitmap(panel_handle, 0, 100, h_res, 100 + v_lines, line_buffer);
+
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
 }
 
 void task_input_monitor(void *pvParameters) {
