@@ -20,9 +20,10 @@ static const char *TAG = "MACRO_BOARD";
 
 #define PORT 5005
 
-#define GPIO_ROTARY_A    32
-#define GPIO_ROTARY_B    33
-#define GPIO_BUTTON      21
+#define GPIO_ROTARY_A 32
+#define GPIO_ROTARY_B 33
+#define GPIO_ROTARY_BUTTON 21
+#define GPIO_BUTTON_1 14
 
 #define PIN_NUM_MISO       -1 // Not used for ST7789
 #define PIN_NUM_MOSI       23
@@ -46,7 +47,8 @@ typedef struct {
 typedef enum {
     CMD_VOL_UP    = 1,
     CMD_VOL_DOWN  = -1,
-    CMD_BTN_CLICK = 100
+    CMD_BTN_ROTARY_CLICK = 100,
+    CMD_BTN_1 = 101
 } board_command_t;
 
 pc_stats_t global_stats;
@@ -85,7 +87,13 @@ void setup_rotary_gpio()
     io_conf.intr_type = GPIO_INTR_ANYEDGE; 
     gpio_config(&io_conf);
 
-    io_conf.pin_bit_mask = (1ULL << GPIO_BUTTON);
+    io_conf.pin_bit_mask = (1ULL << GPIO_ROTARY_BUTTON);
+    io_conf.mode = GPIO_MODE_INPUT;
+    io_conf.pull_up_en = 1;
+    io_conf.intr_type = GPIO_INTR_NEGEDGE;
+    gpio_config(&io_conf);
+
+    io_conf.pin_bit_mask = (1ULL << GPIO_BUTTON_1);
     io_conf.mode = GPIO_MODE_INPUT;
     io_conf.pull_up_en = 1;
     io_conf.intr_type = GPIO_INTR_NEGEDGE;
@@ -95,7 +103,8 @@ void setup_rotary_gpio()
 
     gpio_isr_handler_add(GPIO_ROTARY_A, gpio_isr_handler, (void*) GPIO_ROTARY_A);
     gpio_isr_handler_add(GPIO_ROTARY_B, gpio_isr_handler, (void*) GPIO_ROTARY_B);
-    gpio_isr_handler_add(GPIO_BUTTON, gpio_isr_handler, (void*) GPIO_BUTTON);
+    gpio_isr_handler_add(GPIO_ROTARY_BUTTON, gpio_isr_handler, (void*) GPIO_ROTARY_BUTTON);
+    gpio_isr_handler_add(GPIO_BUTTON_1, gpio_isr_handler, (void*) GPIO_BUTTON_1);
 }
 
 void setup_wifi()
@@ -196,14 +205,25 @@ static void IRAM_ATTR gpio_isr_handler(void* arg) {
     uint32_t gpio_num = (uint32_t) arg;
     BaseType_t xHigherPriorityTaskWoken = pdFALSE;
 
-    if (gpio_num == GPIO_BUTTON) {
+    if (gpio_num == GPIO_ROTARY_BUTTON) {
         static int64_t last_btn_time = 0;
         int64_t now = esp_timer_get_time();
 
         // 200ms debounce
         if (now - last_btn_time > 200000) { 
             last_btn_time = now;
-            int send_val = CMD_BTN_CLICK;
+            int send_val = CMD_BTN_ROTARY_CLICK;
+            xQueueSendFromISR(xRotaryQueue, &send_val, &xHigherPriorityTaskWoken);
+        }
+    }
+    else if (gpio_num == GPIO_BUTTON_1){
+        static int64_t last_btn_time = 0;
+        int64_t now = esp_timer_get_time();
+
+        // 200ms debounce
+        if (now - last_btn_time > 200000) { 
+            last_btn_time = now;
+            int send_val = CMD_BTN_1;
             xQueueSendFromISR(xRotaryQueue, &send_val, &xHigherPriorityTaskWoken);
         }
     }
@@ -290,9 +310,10 @@ void task_network_ssh(void *pvParameters) {
     while(1) {
         if (xQueueReceive(xCommandQueue, &command_buffer, pdMS_TO_TICKS(10)) == pdTRUE) {
             const char* msg = "";
-            if (command_buffer == CMD_BTN_CLICK) msg = "CLICK";
+            if (command_buffer == CMD_BTN_ROTARY_CLICK) msg = "CLICK";
             else if (command_buffer == CMD_VOL_UP) msg = "VOL_UP";
             else if (command_buffer == CMD_VOL_DOWN) msg = "VOL_DOWN";
+            else if (command_buffer == CMD_BTN_1) msg = "CLICK_1";
             
             sendto(sock, msg, strlen(msg), 0, (struct sockaddr *)&pc_addr, sizeof(pc_addr));
         }
@@ -395,7 +416,7 @@ void task_input_monitor(void *pvParameters) {
     while (1) {
         if (xQueueReceive(xRotaryQueue, &buffer, portMAX_DELAY) == pdTRUE)
         {
-            if (buffer == CMD_BTN_CLICK) {
+            if (buffer == CMD_BTN_ROTARY_CLICK) {
                 ESP_LOGI("INPUT", "Action: BUTTON CLICK");
                 // TODO: Later, this might toggle a menu mode
             } 
