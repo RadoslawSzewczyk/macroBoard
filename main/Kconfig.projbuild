@@ -1,0 +1,21 @@
+menu "Project Configuration"
+
+    config ESP_WIFI_SSID
+        string "WiFi SSID"
+        default "MY_WIFI_NAME"
+        help
+            SSID (Network Name) of the WiFi network to connect to.
+
+    config ESP_WIFI_PASSWORD
+        string "WiFi Password"
+        default "MY_WIFI_PASS"
+        help
+            Password for the WiFi network.
+
+    config PC_IP_ADDRESS
+        string "PC IP Address"
+        default "192.168.1.100"
+        help
+            The IP address of the PC running the Python script.
+
+endmenu
