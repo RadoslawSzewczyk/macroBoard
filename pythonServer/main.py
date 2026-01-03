@@ -3,6 +3,7 @@ import pyautogui
 import psutil
 import time
 import threading
+import random
 
 # CONFIGURATION
 UDP_IP = "0.0.0.0"
